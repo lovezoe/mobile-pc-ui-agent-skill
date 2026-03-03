@@ -141,7 +141,7 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
     if args.mode == "mobile":
-        target_script = os.path.join(script_dir, "mobile", "run_gui_owl_1_5_for_mobile.py")
+        target_script = os.path.join(script_dir, "run_gui_owl_1_5_for_mobile.py")
         adb_path = detect_adb()
         if not adb_path:
             print_error("ADB not found in PATH or common SDK locations.", "Mobile UI (Android)")
@@ -160,7 +160,7 @@ def main():
         ]
         
     else:  # pc mode
-        target_script = os.path.join(script_dir, "pc", "run_gui_owl_1_5_for_pc.py")
+        target_script = os.path.join(script_dir, "run_gui_owl_1_5_for_pc.py")
         # Quick PC check for dependency
         try:
             import pyautogui
