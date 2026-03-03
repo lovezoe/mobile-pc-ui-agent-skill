@@ -20,7 +20,7 @@ def check_service():
     print("Checking if VLM service is running...")
     url = "http://localhost:8080/v1/models"
     try:
-        with request.urlopen(url, timeout=2) as response:
+        with request.urlopen(url, timeout=30) as response:
             if response.status == 200:
                 data = json.loads(response.read().decode())
                 for model in data.get("data", []):
