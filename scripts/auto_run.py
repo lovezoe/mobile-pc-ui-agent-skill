@@ -35,9 +35,9 @@ def start_service():
     """Start the llamacpp.server in the background."""
     print("Starting VLM service...")
     
-    server_cmd = "llamacpp.server"
+    server_cmd = "llama-server"
     if sys.platform == "win32":
-        server_cmd = "llamacpp.server.exe"
+        server_cmd = "llama-server"
 
     if shutil.which(server_cmd) is None:
         print_error(
