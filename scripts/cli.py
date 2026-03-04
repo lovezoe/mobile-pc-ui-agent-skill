@@ -26,8 +26,39 @@ from typing import Optional, Dict, Any
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.expanduser("~/.config/mobile-pc-ui-agent")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.yaml")
+SERVER_CONFIG_FILE = os.path.join(CONFIG_DIR, "server.json")
 SERVER_PID_FILE = os.path.join(SCRIPT_DIR, ".uiagent_server.pid")
 SERVER_PORT = 18081
+
+
+def save_server_config(port: int):
+    """Save server port to config file"""
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(SERVER_CONFIG_FILE, "w") as f:
+            json.dump({"port": port, "pid": os.getpid()}, f)
+    except Exception as e:
+        print(f"Warning: Failed to save server config: {e}")
+
+
+def load_server_config() -> Optional[Dict[str, Any]]:
+    """Load server port from config file"""
+    try:
+        if os.path.exists(SERVER_CONFIG_FILE):
+            with open(SERVER_CONFIG_FILE, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+
+def clear_server_config():
+    """Clear server config file"""
+    try:
+        if os.path.exists(SERVER_CONFIG_FILE):
+            os.remove(SERVER_CONFIG_FILE)
+    except Exception:
+        pass
 
 config: Dict[str, Any] = {}
 
@@ -302,6 +333,8 @@ def cmd_psexec_server(args):
     with open(SERVER_PID_FILE, "w") as f:
         f.write(str(os.getpid()))
     
+    save_server_config(SERVER_PORT)
+    
     print_success(f"Server started successfully")
     print(f"HTTP API: http://127.0.0.1:{SERVER_PORT}")
     
@@ -316,6 +349,7 @@ def cmd_psexec_server(args):
         server_state["running"] = False
         if os.path.exists(SERVER_PID_FILE):
             os.remove(SERVER_PID_FILE)
+        clear_server_config()
         print("Server stopped.")
 
 
@@ -465,6 +499,10 @@ def process_queue():
                 server_state["current_task"] = task
         
         if task:
+            mode = task.get("mode", "unknown")
+            instruction = task.get("instruction", "")[:50]
+            print(f"[QUEUE] Starting task: [{mode}] {instruction}...")
+            
             try:
                 result = execute_agent(
                     task["mode"],
@@ -476,9 +514,11 @@ def process_queue():
                 )
                 task["result"] = result
                 task["status"] = "completed"
+                print(f"[QUEUE] Task completed: [{mode}] {instruction}...")
             except Exception as e:
                 task["result"] = f"Error: {str(e)}"
                 task["status"] = "failed"
+                print(f"[QUEUE] Task failed: [{mode}] {instruction} - {e}")
             
             with server_state["queue_lock"]:
                 server_state["current_task"] = None
@@ -504,10 +544,11 @@ def get_queue_status():
 
 class ServerHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass
+        print(f"[HTTP] {self.address_string()} - {format % args}")
     
     def do_POST(self):
         if self.path == "/execute":
+            print(f"[REQUEST] New execute request received")
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length)
             try:
@@ -544,6 +585,8 @@ class ServerHandler(BaseHTTPRequestHandler):
                     server_state["task_queue"].append(task)
                     queue_pos = len(server_state["task_queue"])
                     is_processing = server_state["current_task"] is not None
+                    
+                    print(f"[REQUEST] Task queued: [{task.get('mode')}] {task.get('instruction', '')[:50]}... (position: {queue_pos})")
                 
                 if not is_processing:
                     pass
@@ -719,6 +762,8 @@ def cmd_server(args):
     print(f"HTTP API: http://127.0.0.1:{SERVER_PORT}")
     print("Press Ctrl+C to stop the server...")
     
+    save_server_config(SERVER_PORT)
+    
     server_thread = threading.Thread(target=run_server_http, args=(SERVER_PORT,), daemon=True)
     server_thread.start()
     
@@ -734,6 +779,7 @@ def cmd_server(args):
         server_state["running"] = False
         if os.path.exists(SERVER_PID_FILE):
             os.remove(SERVER_PID_FILE)
+        clear_server_config()
         print("Server stopped.")
 
 
@@ -768,11 +814,24 @@ def ipc_execute(mode: str, instruction: str, api_key: Optional[str] = None, base
 
 def check_server_running() -> bool:
     global SERVER_PORT
+    
+    server_config = load_server_config()
+    if server_config and "port" in server_config:
+        port = server_config["port"]
+        try:
+            with request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as response:
+                if response.status == 200:
+                    SERVER_PORT = port
+                    return True
+        except Exception:
+            pass
+    
     for port in range(18081, 18091):
         try:
             with request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as response:
                 if response.status == 200:
                     SERVER_PORT = port
+                    save_server_config(port)
                     return True
         except Exception:
             continue
