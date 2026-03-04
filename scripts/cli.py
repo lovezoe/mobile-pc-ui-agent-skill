@@ -155,7 +155,7 @@ def check_macos_permissions() -> bool:
     try:
         result = subprocess.run(
             ["osascript", "-e", 'tell app "System Events" to get name of every process whose background only is false'],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, errors='replace', timeout=10
         )
         print("  [OK] Accessibility permission check passed")
     except Exception:
@@ -228,6 +228,7 @@ def get_windows_session_id() -> Optional[int]:
             ["query", "session"],
             capture_output=True,
             text=True,
+            errors='replace',
             timeout=10
         )
         for line in result.stdout.splitlines():
@@ -257,6 +258,7 @@ def is_interactive_session() -> bool:
             ["query", "session", str(session_id)],
             capture_output=True,
             text=True,
+            errors='replace',
             timeout=10
         )
         return "Active" in result.stdout or "Console" in result.stdout
@@ -311,7 +313,8 @@ def start_server_with_psexec(script_path: str, port: int) -> bool:
             ["psexec", "-d", "-i", "-w", "180000", cmd],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            errors='replace'
         )
         
         stdout, stderr = proc.communicate(timeout=30)
@@ -439,7 +442,7 @@ def start_ollama_service(model: Optional[str]) -> bool:
         subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(3)
         
-        result = subprocess.run(["ollama", "list"], capture_output=True, text=True)
+        result = subprocess.run(["ollama", "list"], capture_output=True, text=True, errors='replace')
         if model.split(":")[0] not in result.stdout:
             print(f"Pulling model {model} (this may take a while)...")
             proc = subprocess.run(["ollama", "pull", model], check=True)
@@ -507,7 +510,7 @@ def detect_adb() -> Optional[str]:
 
 def check_android_device(adb_path: str) -> bool:
     try:
-        result = subprocess.run([adb_path, "devices"], capture_output=True, text=True, check=True)
+        result = subprocess.run([adb_path, "devices"], capture_output=True, text=True, errors='replace', check=True)
         lines = result.stdout.strip().splitlines()
         devices = [line for line in lines[1:] if "device" in line and "offline" not in line and "unauthorized" not in line]
         
@@ -751,7 +754,7 @@ def execute_agent(mode: str, instruction: str, api_key: Optional[str], base_url:
     task_timeout = 600
     
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=task_timeout)
+        result = subprocess.run(cmd, capture_output=True, text=True, errors='replace', check=True, timeout=task_timeout)
         return result.stdout + result.stderr
     except subprocess.TimeoutExpired:
         return f"Error: Task timed out after {task_timeout} seconds"
