@@ -19,6 +19,7 @@ import yaml
 import threading
 import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from urllib import request, error
 from typing import Optional, Dict, Any
 
@@ -189,6 +190,135 @@ def check_windows_permissions() -> bool:
     return True
 
 
+def get_windows_session_id() -> Optional[int]:
+    """Get the active user session ID on Windows"""
+    try:
+        result = subprocess.run(
+            ["query", "session"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        for line in result.stdout.splitlines():
+            if "Active" in line or "Console" in line:
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        return int(parts[1])
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+    return None
+
+
+def is_interactive_session() -> bool:
+    """Check if running in an interactive desktop session"""
+    if sys.platform != "win32":
+        return True
+    
+    session_id = get_windows_session_id()
+    if session_id is None:
+        return False
+    
+    try:
+        result = subprocess.run(
+            ["query", "session", str(session_id)],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        return "Active" in result.stdout or "Console" in result.stdout
+    except Exception:
+        return False
+
+
+def check_psexec_available() -> bool:
+    """Check if psexec is available"""
+    return shutil.which("psexec") is not None
+
+
+def run_in_desktop_session() -> bool:
+    """Check if we need to run in desktop session via psexec"""
+    if sys.platform != "win32":
+        return False
+    
+    if is_interactive_session():
+        print("  [OK] Running in interactive desktop session")
+        return False
+    
+    print("  [!] Not running in desktop session (SSH/remote detected)")
+    return True
+
+
+def start_server_with_psexec(script_path: str, port: int) -> bool:
+    """Start server in desktop session using psexec"""
+    if not check_psexec_available():
+        print_error("psexec not found in PATH")
+        print("Download psexec from: https://docs.microsoft.com/en-us/sysinternals/downloads/psexec")
+        print("Or run: choco install psexec")
+        return False
+    
+    python_exe = sys.executable
+    cmd = f'"{python_exe}" "{script_path}" --psexec-server --port {port}'
+    
+    print(f"Starting server in desktop session via psexec...")
+    print(f"  Command: {cmd}")
+    
+    try:
+        subprocess.run(
+            ["psexec", "-d", "-i", cmd],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        print("  [OK] Server started in desktop session")
+        return True
+    except subprocess.CalledProcessError as e:
+        print_error(f"Failed to start server with psexec: {e}")
+        return False
+
+
+def cmd_psexec_server(args):
+    """Handle psexec server mode (internal use)"""
+    port = getattr(args, 'port', 18081)
+    setup_display_for_ssh()
+    check_screen_permissions()
+    
+    mode = args.mode or get_config_value("mode", default="local")
+    base_url = get_config_value("local", "base_url") if mode == "local" else get_config_value("remote", "base_url")
+    
+    if check_service(base_url):
+        print_success(f"VLM service is already running at {base_url}")
+    else:
+        if mode == "local":
+            if not start_ollama_service(get_config_value("local", "model", default="ahmadwaqar/gui-owl:7b-q8")):
+                sys.exit(1)
+        else:
+            print_error(f"VLM service is not running at {base_url}")
+            sys.exit(1)
+    
+    SERVER_PORT = port
+    with open(SERVER_PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    
+    print_success(f"Server started successfully")
+    print(f"HTTP API: http://127.0.0.1:{SERVER_PORT}")
+    
+    server_thread = threading.Thread(target=run_server_http, args=(SERVER_PORT,), daemon=True)
+    server_thread.start()
+    
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nShutting down server...")
+        server_state["running"] = False
+        if os.path.exists(SERVER_PID_FILE):
+            os.remove(SERVER_PID_FILE)
+        print("Server stopped.")
+
+
 def setup_display_for_ssh():
     """Setup display for SSH sessions"""
     if sys.platform == "linux":
@@ -311,8 +441,65 @@ def check_android_device(adb_path: str) -> bool:
 
 server_state = {
     "ollama_process": None,
-    "running": True
+    "running": True,
+    "task_queue": [],
+    "current_task": None,
+    "completed_tasks": [],
+    "queue_lock": threading.Lock()
 }
+
+MAX_QUEUE_SIZE = 100
+MAX_COMPLETED_HISTORY = 10
+
+
+def process_queue():
+    """Process tasks from queue sequentially"""
+    max_completed_history = 10
+    
+    while server_state["running"]:
+        task = None
+        with server_state["queue_lock"]:
+            if server_state["task_queue"]:
+                task = server_state["task_queue"].pop(0)
+                task["status"] = "processing"
+                server_state["current_task"] = task
+        
+        if task:
+            try:
+                result = execute_agent(
+                    task["mode"],
+                    task["instruction"],
+                    task["api_key"],
+                    task["base_url"],
+                    task["model"],
+                    task.get("add_info", "")
+                )
+                task["result"] = result
+                task["status"] = "completed"
+            except Exception as e:
+                task["result"] = f"Error: {str(e)}"
+                task["status"] = "failed"
+            
+            with server_state["queue_lock"]:
+                server_state["current_task"] = None
+                
+                completed = server_state.get("completed_tasks", [])
+                completed.append(task)
+                if len(completed) > max_completed_history:
+                    completed = completed[-max_completed_history:]
+                server_state["completed_tasks"] = completed
+        
+        time.sleep(0.5)
+
+
+def get_queue_status():
+    """Get current queue status"""
+    with server_state["queue_lock"]:
+        return {
+            "current_task": server_state["current_task"],
+            "queue_length": len(server_state["task_queue"]),
+            "is_processing": server_state["current_task"] is not None
+        }
 
 
 class ServerHandler(BaseHTTPRequestHandler):
@@ -331,13 +518,60 @@ class ServerHandler(BaseHTTPRequestHandler):
                 base_url = request_data.get("base_url")
                 model = request_data.get("model")
                 add_info = request_data.get("add_info", "")
+                blocking = request_data.get("blocking", True)
                 
-                result = execute_agent(mode, instruction, api_key, base_url, model, add_info)
+                task = {
+                    "mode": mode,
+                    "instruction": instruction,
+                    "api_key": api_key,
+                    "base_url": base_url,
+                    "model": model,
+                    "add_info": add_info,
+                    "status": "queued"
+                }
                 
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "success", "result": result}).encode())
+                with server_state["queue_lock"]:
+                    if len(server_state["task_queue"]) >= MAX_QUEUE_SIZE:
+                        self.send_response(503)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({
+                            "status": "error",
+                            "error": f"Queue full (max {MAX_QUEUE_SIZE}), try again later"
+                        }).encode())
+                        return
+                    
+                    server_state["task_queue"].append(task)
+                    queue_pos = len(server_state["task_queue"])
+                    is_processing = server_state["current_task"] is not None
+                
+                if not is_processing:
+                    pass
+                
+                if blocking:
+                    while task["status"] == "queued" or task["status"] == "processing":
+                        time.sleep(1)
+                        with server_state["queue_lock"]:
+                            if task["status"] == "completed" or task["status"] == "failed":
+                                break
+                    
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "status": task["status"],
+                        "result": task.get("result", "")
+                    }).encode())
+                else:
+                    self.send_response(202)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "status": "queued",
+                        "queue_position": queue_pos,
+                        "message": "Task queued, use /queue/status to check progress"
+                    }).encode())
+                    
             except Exception as e:
                 self.send_response(500)
                 self.send_header("Content-Type", "application/json")
@@ -347,7 +581,13 @@ class ServerHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"status": "ok"}).encode())
+            queue_status = get_queue_status()
+            self.wfile.write(json.dumps({"status": "ok", "queue": queue_status}).encode())
+        elif self.path == "/queue/status":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(get_queue_status()).encode())
         elif self.path == "/stop":
             server_state["running"] = False
             self.send_response(200)
@@ -415,15 +655,22 @@ def execute_agent(mode: str, instruction: str, api_key: Optional[str], base_url:
     if add_info:
         cmd.extend(["--add_info", add_info])
 
+    task_timeout = 600
+    
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=task_timeout)
         return result.stdout + result.stderr
+    except subprocess.TimeoutExpired:
+        return f"Error: Task timed out after {task_timeout} seconds"
     except subprocess.CalledProcessError as e:
         return f"Error: {e.stderr}"
 
 
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
 def run_server_http(port: int):
-    server = HTTPServer(('127.0.0.1', port), ServerHandler)
+    server = ThreadingHTTPServer(('127.0.0.1', port), ServerHandler)
     print(f"Server HTTP API running on http://127.0.0.1:{port}")
     while server_state["running"]:
         server.handle_request()
@@ -431,6 +678,18 @@ def run_server_http(port: int):
 
 def cmd_server(args):
     global SERVER_PORT
+    
+    if run_in_desktop_session():
+        script_path = os.path.abspath(__file__)
+        SERVER_PORT = find_free_port()
+        
+        if not start_server_with_psexec(script_path, SERVER_PORT):
+            print_error("Failed to start server in desktop session")
+            sys.exit(1)
+        
+        print(f"Server started in desktop session, connecting...")
+        time.sleep(3)
+        return
     
     setup_display_for_ssh()
     if not check_screen_permissions():
@@ -462,6 +721,10 @@ def cmd_server(args):
     
     server_thread = threading.Thread(target=run_server_http, args=(SERVER_PORT,), daemon=True)
     server_thread.start()
+    
+    queue_thread = threading.Thread(target=process_queue, daemon=True)
+    queue_thread.start()
+    print("Task queue processor started")
     
     try:
         while True:
@@ -540,6 +803,25 @@ def cmd_mobile(args):
 
 def main():
     global config
+    
+    if "--psexec-server" in sys.argv:
+        port = 18081
+        mode = "local"
+        for i, arg in enumerate(sys.argv):
+            if arg == "--port" and i + 1 < len(sys.argv):
+                port = int(sys.argv[i + 1])
+            if arg == "--mode" and i + 1 < len(sys.argv):
+                mode = sys.argv[i + 1]
+        
+        class Args:
+            def __init__(self):
+                self.command = "server"
+                self.mode = mode
+                self.port = port
+        
+        cmd_psexec_server(Args())
+        return
+    
     config = load_config()
     
     mode = get_config_value("mode", default="local")

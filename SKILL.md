@@ -104,7 +104,7 @@ python scripts/cli.py server --mode remote
 
 3. The server will check if the remote service is running, otherwise prompt you to start it manually.
 
-### SSH Remote Execution
+### SSH Remote Execution (Linux/macOS)
 
 For SSH sessions, the server automatically:
 - Detects SSH connection
@@ -113,10 +113,28 @@ For SSH sessions, the server automatically:
 
 ```bash
 # Option 1: X11 forwarding
-ssh -X user@host "cd /path/to/uiagent && python scripts/cli.py server"
+ssh -X user@host "cd /path/to/mobile-pc-ui-agent && python scripts/cli.py server"
 
 # Option 2: Set DISPLAY manually
 export DISPLAY=:0
+python scripts/cli.py server
+```
+
+### Windows Remote Execution (PSExec)
+
+On Windows, when running via SSH or remote session, the server automatically:
+- Detects if running in a non-interactive session
+- Uses PSExec to launch the server in the active desktop session
+
+**Requirements:**
+- Install PSExec (part of Sysinternals):
+  - Download from: https://docs.microsoft.com/en-us/sysinternals/downloads/psexec
+  - Or install via Chocolatey: `choco install psexec`
+  - Or copy to PATH: `cp psexec.exe C:\Windows\System32\`
+
+**Usage:**
+```bash
+# Server automatically detects non-interactive session and uses psexec
 python scripts/cli.py server
 ```
 
