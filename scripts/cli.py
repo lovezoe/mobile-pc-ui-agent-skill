@@ -27,7 +27,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.expanduser("~/.config/mobile-pc-ui-agent")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.yaml")
 SERVER_CONFIG_FILE = os.path.join(CONFIG_DIR, "server.json")
-SERVER_PID_FILE = os.path.join(SCRIPT_DIR, ".uiagent_server.pid")
+SERVER_PID_FILE = os.path.join(CONFIG_DIR, "server.pid")
 SERVER_PORT = 18081
 
 
@@ -291,21 +291,48 @@ def start_server_with_psexec(script_path: str, port: int) -> bool:
         return False
     
     python_exe = sys.executable
+    
+    log_dir = os.path.join(CONFIG_DIR, "logs")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except Exception:
+        log_dir = CONFIG_DIR
+    
+    log_file = os.path.join(log_dir, f"server_{port}.log")
+    
     cmd = f'"{python_exe}" "{script_path}" --psexec-server --port {port}'
     
     print(f"Starting server in desktop session via psexec...")
     print(f"  Command: {cmd}")
+    print(f"  Log file: {log_file}")
     
     try:
-        subprocess.run(
-            ["psexec", "-d", "-i", cmd],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+        proc = subprocess.Popen(
+            ["psexec", "-d", "-i", "-w", "180000", cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
         )
-        print("  [OK] Server started in desktop session")
+        
+        stdout, stderr = proc.communicate(timeout=30)
+        
+        if proc.returncode == 0:
+            print("  [OK] Server started in desktop session")
+            print(f"  Server logs will be written to: {log_file}")
+            return True
+        else:
+            if stdout:
+                print(f"  [stdout] {stdout}")
+            if stderr:
+                print(f"  [stderr] {stderr}")
+            print_error(f"psexec returned code {proc.returncode}")
+            return False
+            
+    except subprocess.TimeoutExpired:
+        print("  [OK] Server started (psexec timeout, server is running in background)")
+        print(f"  Server logs will be written to: {log_file}")
         return True
-    except subprocess.CalledProcessError as e:
+    except Exception as e:
         print_error(f"Failed to start server with psexec: {e}")
         return False
 
@@ -313,6 +340,18 @@ def start_server_with_psexec(script_path: str, port: int) -> bool:
 def cmd_psexec_server(args):
     """Handle psexec server mode (internal use)"""
     port = getattr(args, 'port', 18081)
+    log_file = getattr(args, 'log_file', None)
+    log_handle = None
+    
+    if log_file:
+        try:
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            log_handle = open(log_file, "a")
+            sys.stdout = log_handle
+            sys.stderr = log_handle
+        except Exception as e:
+            print(f"Warning: Failed to redirect logs to file: {e}")
+    
     setup_display_for_ssh()
     check_screen_permissions()
     
@@ -330,6 +369,7 @@ def cmd_psexec_server(args):
             sys.exit(1)
     
     SERVER_PORT = port
+    os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(SERVER_PID_FILE, "w") as f:
         f.write(str(os.getpid()))
     
@@ -341,6 +381,10 @@ def cmd_psexec_server(args):
     server_thread = threading.Thread(target=run_server_http, args=(SERVER_PORT,), daemon=True)
     server_thread.start()
     
+    queue_thread = threading.Thread(target=process_queue, daemon=True)
+    queue_thread.start()
+    print("Task queue processor started")
+    
     try:
         while True:
             time.sleep(1)
@@ -351,6 +395,12 @@ def cmd_psexec_server(args):
             os.remove(SERVER_PID_FILE)
         clear_server_config()
         print("Server stopped.")
+    
+    if log_file and log_handle:
+        try:
+            log_handle.close()
+        except Exception:
+            pass
 
 
 def setup_display_for_ssh():
@@ -797,12 +847,13 @@ def ipc_execute(mode: str, instruction: str, api_key: Optional[str] = None, base
     
     try:
         req = request.Request(url, data=json.dumps(request_data).encode(), headers={'Content-Type': 'application/json'})
-        with request.urlopen(req, timeout=300) as response:
+        with request.urlopen(req, timeout=600) as response:
             result = json.loads(response.read().decode())
-            if result.get("status") == "success":
+            if result.get("status") == "completed":
                 print(result.get("result", ""))
             else:
-                print_error(result.get("error", "Unknown error"))
+                # In case of failure, server puts error details in 'result'
+                print_error(result.get("result", result.get("error", "Unknown error")))
                 sys.exit(1)
     except error.HTTPError as e:
         print_error(f"Server error: {e.code} {e.reason}")
@@ -872,11 +923,15 @@ def main():
             if arg == "--mode" and i + 1 < len(sys.argv):
                 mode = sys.argv[i + 1]
         
+        log_dir = os.path.join(CONFIG_DIR, "logs")
+        log_file = os.path.join(log_dir, f"server_{port}.log")
+        
         class Args:
             def __init__(self):
                 self.command = "server"
                 self.mode = mode
                 self.port = port
+                self.log_file = log_file
         
         cmd_psexec_server(Args())
         return
